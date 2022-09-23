@@ -12,7 +12,7 @@ type Config struct { //nolint:maligned
 	EnableServerTLS    bool   `yaml:"enable_server_tls"`
 	Cert               string `yaml:"cert"`
 	Key                string `yaml:"key"`
-	CfAPI              string `yaml:"cf_api"`
+	BoshAPI            string `yaml:"bosh_api"`
 	AgentPort          string `yaml:"agent_port"`
 	ClientCert         string `yaml:"client_cert"`
 	ClientCertKey      string `yaml:"client_key"`
@@ -28,7 +28,7 @@ var DefaultConfig = Config{
 	EnableServerTLS:    false,
 	Cert:               "test/server.crt",
 	Key:                "test/server.key",
-	CfAPI:              "https://api.cf.aws-cfn02.aws.cfi.sapcloud.io",
+	BoshAPI:            "https://api.bosh.azure-cfn01.aws.cfi.sapcloud.io",
 	AgentPort:          "9494",
 	ClientCert:         "test/client.crt",
 	ClientCertKey:      "test/client.key",

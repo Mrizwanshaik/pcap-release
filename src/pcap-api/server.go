@@ -44,6 +44,11 @@ type cfAppResponse struct {
 	Name string `json:"name"`
 }
 
+type boshVMresponse struct {
+	VMID string `json:"id"`
+	Job  string `json:"job"`
+}
+
 type cfAppStatsResponse struct {
 	Resources []struct {
 		Type  string `json:"type"`
@@ -56,7 +61,160 @@ func (a *Api) handleHealth(response http.ResponseWriter, _ *http.Request) {
 	response.WriteHeader(http.StatusOK)
 }
 
-func (a *Api) handleCapture(response http.ResponseWriter, request *http.Request) {
+func (a *Api) handleCaptureBosh(response http.ResponseWriter, request *http.Request) {
+
+	if request.Method != http.MethodGet {
+		response.WriteHeader(http.StatusMethodNotAllowed)
+
+		return
+	}
+
+	Instance_group := request.URL.Query().Get("Instance_group")
+	// ip_address := request.URL.Query().Get("ips")[0]
+	agentIndexStr := request.URL.Query()["index"]
+	device := request.URL.Query().Get("device")
+	//filter := request.URL.Query().Get("filter")
+	authToken := request.Header.Get("Authorization")
+
+	if Instance_group == "" {
+
+		response.WriteHeader(http.StatusBadRequest)
+		response.Write([]byte("agent_id missing"))
+
+		return
+
+	}
+
+	var agentIndex []int
+
+	if len(agentIndexStr) == 0 {
+		agentIndex = append(agentIndex, 0) // default value
+	} else {
+		for _, agentIndexStr := range agentIndexStr {
+			Index, err := strconv.Atoi(agentIndexStr)
+			if err != nil {
+				response.WriteHeader(http.StatusBadRequest)
+				response.Write([]byte("could not parse index parameter"))
+				return
+			}
+			agentIndex = append(agentIndex, Index)
+		}
+	}
+
+	if device == "" {
+		device = "eth0" // default value
+	}
+
+	if authToken == "" {
+		response.WriteHeader(http.StatusUnauthorized)
+		response.Write([]byte("authentication required"))
+
+		return
+	}
+	// Check if bosh instance can be seen by token
+	instanceVisible, err := a.checkVMinstancebytoken(Instance_group, authToken)
+	if err != nil {
+		log.Errorf("could not check if app %s can be seen by token %s (%s)", Instance_group, authToken, err)
+		response.WriteHeader(http.StatusInternalServerError)
+
+		return
+	}
+	if !instanceVisible {
+		log.Infof("app %s cannot be seen by token %s", Instance_group, authToken)
+		response.WriteHeader(http.StatusForbidden)
+
+		return
+	}
+
+	handleIOError := func(err error) {
+		if errors.Is(err, io.EOF) {
+			log.Debug("Done capturing.")
+		} else {
+			log.Errorf("Error during capture: %s", err)
+		}
+	}
+
+	type packetMessage struct {
+		packet gopacket.Packet
+		done   bool
+	}
+	packets := make(chan packetMessage, 1000)
+
+	for _, index := range agentIndex {
+		go func(Index int, packets chan packetMessage) {
+			defer func() {
+				packets <- packetMessage{
+					packet: nil,
+					done:   true,
+				}
+			}()
+			agentURL := "https://192.168.1.11:25555/deployments/haproxy/instances"
+			pcapStream, err := a.getPcapStream(agentURL)
+			if err != nil {
+				log.Errorf("could not get pcap stream from URL %s (%s)", agentURL, err)
+				// FIXME(max): we see 'http: superfluous response.WriteHeader call' if errors occur in this loop because there is only one response but each routine can fail on it's own.
+				//             there is more than one occurrence.
+				response.WriteHeader(http.StatusBadGateway)
+				return
+			}
+			defer pcapStream.Close()
+
+			// Stream the pcap back to the client
+			pcapReader, err := pcapgo.NewReader(pcapStream)
+			if err != nil {
+				log.Errorf("could not create pcap reader from pcap stream %s (%s)", pcapStream, err)
+				response.WriteHeader(http.StatusBadGateway)
+				return
+			}
+			for {
+				data, capInfo, err := pcapReader.ReadPacketData()
+				if err != nil {
+					handleIOError(err)
+					return
+				}
+				log.Debugf("Read packet: Time %s Length %d Captured %d", capInfo.Timestamp, capInfo.Length, capInfo.CaptureLength)
+				packet := gopacket.NewPacket(data, layers.LayerTypeEthernet, gopacket.Default)
+				packet.Metadata().CaptureInfo = capInfo
+				packets <- packetMessage{
+					packet: packet,
+					done:   false,
+				}
+			}
+		}(index, packets)
+	}
+	// Collect all packets from multiple input streams and merge them into one output stream
+	w := pcapgo.NewWriter(response)
+	err = w.WriteFileHeader(65535, layers.LinkTypeEthernet)
+	if err != nil {
+		log.Error(err)
+		return
+	}
+
+	bytesTotal := 24 // pcap header is 24 bytes
+	done := 0
+	for msg := range packets {
+		if msg.packet != nil {
+			err = w.WritePacket(msg.packet.Metadata().CaptureInfo, msg.packet.Data())
+			if err != nil {
+				handleIOError(err)
+				return
+			}
+			bytesTotal += msg.packet.Metadata().Length
+			if f, ok := response.(http.Flusher); ok {
+				f.Flush()
+			}
+		}
+		if msg.done {
+			done++
+			if done == len(agentIndex) {
+				log.Infof("Done capturing. Wrote %d bytes from %s to %s", bytesTotal, request.URL, request.RemoteAddr)
+				return
+			}
+		}
+	}
+}
+
+func (a *Api) handleCaptureCF(response http.ResponseWriter, request *http.Request) {
 
 	if request.Method != http.MethodGet {
 		response.WriteHeader(http.StatusMethodNotAllowed)
@@ -117,7 +275,7 @@ func (a *Api) handleCapture(response http.ResponseWriter, request *http.Request)
 
 		return
 	}
-	if appVisible == false {
+	if !appVisible {
 		log.Infof("app %s cannot be seen by token %s", appId, authToken)
 		response.WriteHeader(http.StatusForbidden)
 
@@ -310,6 +468,50 @@ func (a *Api) getAppLocation(appId string, appIndex int, appType string, authTok
 	return "", fmt.Errorf("could not find process with index %d of type %s for app %s", appIndex, appType, appId)
 }
 
+func (a *Api) checkVMinstancebytoken(id string, authToken string) (bool, error) {
+
+	log.Debugf("Checking at %s if vm instance %s can be seen by token %s", a.ccBaseURL, id, authToken)
+	httpClient := http.DefaultClient
+
+	iURL, err := url.Parse(fmt.Sprintf("%s/deployments/instance/%s", a.ccBaseURL, id))
+
+	if err != nil {
+		return false, err
+	}
+
+	req := &http.Request{
+		Method: "GET",
+		URL:    iURL,
+		Header: map[string][]string{
+			"Authorization": {authToken},
+		},
+	}
+
+	res, err := httpClient.Do(req)
+	if err != nil {
+		return false, err
+	}
+	if res.StatusCode != http.StatusOK {
+		return false, fmt.Errorf("expected status code %d but got status code %d", http.StatusOK, res.StatusCode)
+	}
+	var boshResponse *boshVMresponse
+	data, err := ioutil.ReadAll(res.Body)
+	if err != nil {
+		return false, err
+	}
+	err = json.Unmarshal(data, &boshResponse)
+	if err != nil {
+		return false, err
+	}
+
+	if boshResponse.VMID != id {
+		return false, fmt.Errorf("expected instance id %s but got instace id %s (%s)", id, boshResponse.VMID, boshResponse.Job)
+	}
+
+	return true, nil
+
+}
+
 func (a *Api) isAppVisibleByToken(appId string, authToken string) (bool, error) {
 	log.Debugf("Checking at %s if app %s can be seen by token %s", a.ccBaseURL, appId, authToken)
 	httpClient := http.DefaultClient
@@ -353,10 +555,10 @@ func (a *Api) isAppVisibleByToken(appId string, authToken string) (bool, error) 
 
 func (a *Api) setup() {
 	log.Info("Discovering CF API endpoints...")
-	response, err := http.Get(a.config.CfAPI)
+	response, err := http.Get(a.config.BoshAPI)
 
 	if err != nil {
-		log.Fatalf("Could not fetch CF API from %s (%s)", a.config.CfAPI, err)
+		log.Fatalf("Could not fetch CF API from %s (%s)", a.config.BoshAPI, err)
 	}
 
 	var apiResponse *cfAPIResponse
@@ -381,7 +583,9 @@ func (a *Api) Run() {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/health", a.handleHealth)
-	mux.HandleFunc("/capture", a.handleCapture)
+	mux.HandleFunc("/capture", a.handleCaptureCF)
+	mux.HandleFunc("/capture/cf", a.handleCaptureCF)
+	mux.HandleFunc("/capture/bosh", a.handleCaptureBosh)
 	log.Info("Starting CLI file Api at root " + a.config.CLIDownloadRoot)
 	mux.Handle("/cli/", http.StripPrefix("/cli/", http.FileServer(http.Dir(a.config.CLIDownloadRoot))))
 

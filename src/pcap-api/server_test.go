@@ -33,7 +33,7 @@ var _ = Describe("Basic Tests", func() {
 
 	Context("When the Pcap API is started with the default config", func() {
 		cfg := DefaultConfig
-		cfg.CfAPI = cfAPI.URL
+		cfg.BoshAPI = cfAPI.URL
 		BeforeEach(func() {
 			pcapApi, err = NewApi(&cfg)
 			Expect(err).To(BeNil())
@@ -79,7 +79,7 @@ var _ = Describe("Single Target Capture Tests", func() {
 	}
 	cfAPI := test.MockCfAPI(responses)
 	cfg := DefaultConfig
-	cfg.CfAPI = cfAPI.URL
+	cfg.BoshAPI = cfAPI.URL
 	cfg.AgentPort = pcapAgent.Port
 
 	BeforeEach(func() {
@@ -196,7 +196,7 @@ var _ = Describe("Multiple Target Capture Tests", func() {
 	}
 	cfAPI := test.MockCfAPI(responses)
 	cfg := DefaultConfig
-	cfg.CfAPI = cfAPI.URL
+	cfg.BoshAPI = cfAPI.URL
 	cfg.AgentPort = pcapAgent.Port
 
 	BeforeEach(func() {
